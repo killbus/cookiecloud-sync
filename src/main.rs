@@ -1,142 +1,183 @@
-mod client;
-mod cookiefile;
-mod decrypt;
-
+use clap::Parser;
+use cookiecloud_sync::{build_config, sync_once, DEFAULT_FORMAT, DEFAULT_INTERVAL};
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::{error, info, warn};
 
-use clap::Parser;
-use tracing::{error, info};
-
-const DEFAULT_OUTPUT: &str = "/output/cookies.txt";
-const DEFAULT_INTERVAL: u64 = 300;
-const DEFAULT_FORMAT: &str = "netscape";
+const ENV_SERVER_URL: &str = "COOKIECLOUD_URL";
+const ENV_UUID: &str = "COOKIECLOUD_UUID";
+const ENV_PASSWORD: &str = "COOKIECLOUD_PASSWORD";
+const ENV_OUTPUT_FORMAT: &str = "OUTPUT_FORMAT";
+const ENV_INTERVAL: &str = "INTERVAL";
+const ENV_EXPORT_SPECS: &str = "EXPORT_SPECS";
+const ENV_CRYPTO_TYPE: &str = "COOKIECLOUD_CRYPTO_TYPE";
+const ENV_TIMEOUT: &str = "TIMEOUT";
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Parser)]
 #[command(
     name = "cookiecloud-sync",
+    version = "1.0.0",
     about = "Periodically sync cookies from CookieCloud"
 )]
 struct Cli {
-    #[arg(short = 's', long = "server", env = "COOKIECLOUD_URL")]
+    #[arg(short = 's', long = "server", env = ENV_SERVER_URL)]
     server_url: String,
 
-    #[arg(short = 'u', long = "uuid", env = "COOKIECLOUD_UUID")]
+    #[arg(short = 'u', long = "uuid", env = ENV_UUID)]
     uuid: String,
 
-    #[arg(short = 'p', long = "password", env = "COOKIECLOUD_PASSWORD")]
-    password: String,
+    #[arg(short = 'p', long = "password", env = ENV_PASSWORD, conflicts_with = "password_file")]
+    password: Option<String>,
 
-    #[arg(short = 'o', long = "output", env = "OUTPUT_FILE", default_value = DEFAULT_OUTPUT)]
-    output_file: PathBuf,
+    #[arg(
+        long = "password-file",
+        conflicts_with = "password",
+        help = "Read password from file (first line, trimmed)"
+    )]
+    password_file: Option<PathBuf>,
 
-    #[arg(short = 'f', long = "format", env = "OUTPUT_FORMAT", default_value = DEFAULT_FORMAT)]
+    #[arg(
+        short = 'f',
+        long = "format",
+        env = ENV_OUTPUT_FORMAT,
+        default_value = DEFAULT_FORMAT,
+        help = "Default output format: netscape, json, or both"
+    )]
     output_format: String,
 
-    #[arg(short = 'i', long = "interval", env = "INTERVAL_SECS", default_value_t = DEFAULT_INTERVAL)]
+    #[arg(
+        short = 'i',
+        long = "interval",
+        env = ENV_INTERVAL,
+        default_value_t = DEFAULT_INTERVAL
+    )]
     interval_secs: u64,
 
     #[arg(long = "once", help = "Run once and exit")]
     once: bool,
+
+    #[arg(
+        long = "dry-run",
+        help = "Decrypt and log what would be written, without writing files"
+    )]
+    dry_run: bool,
+
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Enable debug-level logging",
+        conflicts_with = "quiet"
+    )]
+    verbose: bool,
+
+    #[arg(
+        short = 'q',
+        long = "quiet",
+        help = "Suppress output except errors",
+        conflicts_with = "verbose"
+    )]
+    quiet: bool,
+
+    #[arg(
+        long = "export",
+        help = "Export spec: <domains>:<file>[:<format>]\n\
+                domains: comma-separated list, empty for all\n\
+                file: output path\n\
+                format: netscape, json, or both (optional)\n\
+                Can be repeated. Combined with env EXPORT_SPECS\n\
+                (same format, semicolon-separated); CLI overrides env on path conflict."
+    )]
+    exports: Vec<String>,
+
+    #[arg(
+        short = 'c',
+        long = "crypto-type",
+        env = ENV_CRYPTO_TYPE,
+        help = "Encryption algorithm: legacy or aes-128-cbc-fixed (default: auto)"
+    )]
+    crypto_type: Option<String>,
+
+    #[arg(
+        long = "timeout",
+        env = ENV_TIMEOUT,
+        default_value_t = DEFAULT_TIMEOUT_SECS,
+        help = "HTTP request timeout in seconds"
+    )]
+    timeout_secs: u64,
+
+    #[arg(
+        long = "output-dir",
+        env = "OUTPUT_DIR",
+        help = "Base directory for relative export paths"
+    )]
+    output_dir: Option<PathBuf>,
 }
 
-#[derive(Debug)]
-struct Config {
-    server_url: String,
-    uuid: String,
-    password: String,
-    output_file: PathBuf,
-    output_format: String,
-    interval: Duration,
-    once: bool,
-}
-
-impl Config {
-    fn from_cli(cli: &Cli) -> Result<Self, String> {
-        match cli.output_format.as_str() {
-            "netscape" | "json" | "both" => {}
-            other => {
-                return Err(format!(
-                    "invalid output format: {other} (use netscape, json, or both)"
-                ))
-            }
-        }
-        Ok(Config {
-            server_url: cli.server_url.clone(),
-            uuid: cli.uuid.clone(),
-            password: cli.password.clone(),
-            output_file: cli.output_file.clone(),
-            output_format: cli.output_format.clone(),
-            interval: Duration::from_secs(cli.interval_secs),
-            once: cli.once,
-        })
-    }
-}
-
-fn write_cookies(data: &decrypt::DecryptedData, config: &Config) -> Result<(), String> {
-    let fmt = config.output_format.as_str();
-    if fmt == "netscape" || fmt == "both" {
-        cookiefile::write_netscape(data, &config.output_file)
-            .map_err(|e| format!("failed to write Netscape file: {e}"))?;
-        info!(path = %config.output_file.display(), "wrote Netscape cookie file");
-    }
-    if fmt == "json" || fmt == "both" {
-        let json_path = if fmt == "both" {
-            let mut p = config.output_file.clone();
-            let stem = p
-                .file_stem()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or("cookies");
-            p.set_file_name(format!("{stem}.json"));
-            p
-        } else {
-            config.output_file.clone()
-        };
-        cookiefile::write_json(data, &json_path)
-            .map_err(|e| format!("failed to write JSON file: {e}"))?;
-        info!(path = %json_path.display(), "wrote JSON cookie file");
-    }
-    Ok(())
-}
-
-async fn sync_once(http_client: &reqwest::Client, config: &Config) -> Result<(), String> {
-    let encrypted = client::fetch_encrypted(http_client, &config.server_url, &config.uuid)
-        .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
-
-    let crypto_type = encrypted.crypto_type.as_deref();
-    let data = decrypt::decrypt(
-        &config.uuid,
-        &encrypted.encrypted,
-        &config.password,
-        crypto_type,
-    )
-    .map_err(|e| format!("decrypt failed: {e}"))?;
-
-    let cookie_count: usize = data.cookie_data.values().map(|v| v.len()).sum();
-    info!(
-        domains = data.cookie_data.len(),
-        cookies = cookie_count,
-        "decrypted successfully"
-    );
-
-    write_cookies(&data, config)?;
-    Ok(())
+fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    use rand::Rng;
+    let max_secs = base.as_secs_f64();
+    let secs = max_secs.min(1.0 * 2f64.powi(attempt as i32 - 1));
+    let jitter = 0.75 + rand::thread_rng().gen::<f64>() * 0.5;
+    Duration::from_secs_f64(secs * jitter)
 }
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
+    let log_level = if cli.quiet {
+        "error"
+    } else if cli.verbose {
+        "debug"
+    } else {
+        "info"
+    };
+
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
 
-    let cli = Cli::parse();
-    let config = match Config::from_cli(&cli) {
+    if cli.dry_run {
+        warn!("dry-run mode: no files will be written");
+    }
+
+    let password = match (cli.password, cli.password_file) {
+        (Some(p), _) => p,
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                error!("failed to read password file '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        (None, None) => {
+            error!("password required; use -p/--password, --password-file, or COOKIECLOUD_PASSWORD env");
+            std::process::exit(1);
+        }
+    };
+
+    let export_env = std::env::var(ENV_EXPORT_SPECS)
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    let config = match build_config(
+        cli.server_url,
+        cli.uuid,
+        password,
+        cli.output_format,
+        cli.interval_secs,
+        cli.once,
+        cli.dry_run,
+        cli.exports,
+        export_env,
+        cli.crypto_type,
+        cli.output_dir,
+    ) {
         Ok(c) => c,
         Err(e) => {
             error!("{e}");
@@ -146,27 +187,54 @@ async fn main() {
 
     info!(
         server_url = %config.server_url,
-        output = %config.output_file.display(),
-        format = %config.output_format,
+        exports = ?config.exports.iter().map(|e| e.path.display().to_string()).collect::<Vec<_>>(),
+        global_format = ?config.global_format,
+        timeout_secs = cli.timeout_secs,
         interval_secs = %config.interval.as_secs(),
         once = config.once,
+        dry_run = config.dry_run,
         "starting cookiecloud-sync"
     );
 
-    let http_client = reqwest::Client::builder()
+    let http_client = match reqwest::Client::builder()
         .user_agent("cookiecloud-sync/1.0")
+        .timeout(Duration::from_secs(cli.timeout_secs))
         .build()
-        .expect("failed to create HTTP client");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to build HTTP client: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut failures: u32 = 0;
 
     loop {
-        if let Err(e) = sync_once(&http_client, &config).await {
-            error!("sync failed: {e}");
-            if config.once {
-                std::process::exit(1);
+        match sync_once(&http_client, &config).await {
+            Ok(()) => {
+                failures = 0;
+                if config.once {
+                    return;
+                }
             }
-            error!("retrying in {}s", config.interval.as_secs());
-        } else if config.once {
-            return;
+            Err(errors) => {
+                failures += 1;
+                for e in &errors {
+                    error!("{e}");
+                }
+                if config.once {
+                    std::process::exit(1);
+                }
+                let delay = backoff_delay(config.interval, failures);
+                error!(
+                    failures = failures,
+                    delay_secs = %delay.as_secs_f64(),
+                    "sync failed, will retry"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
         }
         tokio::time::sleep(config.interval).await;
     }
